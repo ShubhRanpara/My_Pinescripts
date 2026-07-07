@@ -1,0 +1,234 @@
+//@version=6
+indicator("BTC Master Window Analysis", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+// windowLengthDays generalizes the daily (1), weekly (7), and monthly (~30)
+// scripts into one setting. gapDays controls the space between the end of
+// one window and the start of the next: 0 = perfectly back-to-back.
+windowLengthDays = input.int(30, "Window Length (Days)", minval=1, tooltip="1 = daily behavior, 7 = weekly behavior, ~30 = monthly behavior, or any custom number of days.")
+gapDays = input.int(0, "Gap Between Windows (Days)", minval=0, tooltip="0 = next window starts exactly when the previous one ends. >0 = leaves that many days empty between windows.")
+
+// Optional anchor: if enabled, every window is phase-locked to repeat from
+// this exact date. E.g. anchor it to a Monday with a 7-day window and every
+// window will land on a Monday. Anchor it to the 15th with a 30-day window
+// and every window will land on the 15th. Leave disabled to keep the
+// original behavior (first window starts on the chart's first bar).
+useCustomStart = input.bool(true, "Use Custom Window Start Date")
+customStartTime = input.time(timestamp("1990-01-01 00:00"), "Window Start Date", tooltip="Only used when 'Use Custom Window Start Date' is enabled. Windows repeat every (Window Length + Gap) days from this date.")
+
+rangePercent = input.float(15.0, "Range % Above/Below Center", step=0.1)
+midTolerance = input.float(0.1, "Middle Zone Tolerance %", step=0.05)
+
+showBoxes = input.bool(true, "Show Historical Windows")
+showMiddleLine = input.bool(true, "Show Middle Line")
+
+//=============================================================================
+// STORAGE
+//=============================================================================
+var int insideCount = 0
+var int breakoutCount = 0
+var int middleCount = 0
+var int totalWindows = 0
+
+var float currentUpperPrice = na
+var float currentLowerPrice = na
+var float currentMiddlePrice = na
+
+var float previousUpper = na
+var float previousLower = na
+var float previousMiddle = na
+
+var float previousWindowClose = na
+
+var bool insideSignal = false
+var bool breakoutSignal = false
+var bool middleSignal = false
+
+var label upperLabel = na
+var label lowerLabel = na
+
+//=============================================================================
+// WINDOW SCHEDULING (this is what makes it timeframe-agnostic and gap-exact)
+//=============================================================================
+// Instead of counting calendar-day transitions (which can drift out of sync
+// with real elapsed time whenever the data has any gaps), we schedule the
+// next window's start as an exact millisecond timestamp and fire the moment
+// a bar reaches it. This guarantees the gap is exactly "gapDays", even with
+// weekends, holidays, or missing bars in between.
+var int nextWindowStartTime = na
+
+cycleLengthMs = (windowLengthDays + gapDays) * 24 * 60 * 60 * 1000
+
+// One-time setup on the very first bar: if a custom anchor date is set, work
+// out the correct phase-aligned boundary instead of just starting at the
+// first bar. This is what lets windows land on a specific weekday / day of
+// month / date, even though the chart's data might start mid-cycle.
+if barstate.isfirst and useCustomStart
+    if customStartTime <= time
+        elapsed = time - customStartTime
+        cyclesElapsed = math.floor(elapsed / cycleLengthMs)
+        nextWindowStartTime := customStartTime + cyclesElapsed * cycleLengthMs
+    else
+        nextWindowStartTime := customStartTime
+
+isWindowCreationDay = na(nextWindowStartTime) or time >= nextWindowStartTime
+
+//=============================================================================
+// RESET SIGNALS
+//=============================================================================
+insideSignal := false
+breakoutSignal := false
+middleSignal := false
+
+//=============================================================================
+// NEW WINDOW START (also closes/evaluates the previous window)
+//=============================================================================
+if isWindowCreationDay
+
+    // Last completed bar before this window began (covers the window itself
+    // plus any gap that preceded it)
+    previousWindowClose := close[1]
+
+    // Evaluate the window that just closed (skipped on the very first window,
+    // since there is nothing to evaluate yet)
+    if not na(previousUpper) and not na(previousWindowClose)
+
+        middleUpper = previousMiddle * (1 + midTolerance / 100)
+        middleLower = previousMiddle * (1 - midTolerance / 100)
+
+        insideCondition = previousWindowClose <= previousUpper and previousWindowClose >= previousLower
+        breakoutCondition = previousWindowClose > previousUpper or previousWindowClose < previousLower
+        middleCondition = previousWindowClose >= middleLower and previousWindowClose <= middleUpper
+
+        insideSignal := insideCondition
+        breakoutSignal := breakoutCondition
+        middleSignal := middleCondition
+
+        totalWindows += 1
+
+        if insideCondition
+            insideCount += 1
+
+        if breakoutCondition
+            breakoutCount += 1
+
+        if middleCondition
+            middleCount += 1
+
+    // First candle of the new window
+    windowOpen = open
+
+    currentMiddlePrice := windowOpen
+    currentUpperPrice := windowOpen * (1 + rangePercent / 100)
+    currentLowerPrice := windowOpen * (1 - rangePercent / 100)
+
+    previousUpper := currentUpperPrice
+    previousLower := currentLowerPrice
+    previousMiddle := currentMiddlePrice
+
+    windowStart = time
+    windowEnd = windowStart + windowLengthDays * 24 * 60 * 60 * 1000
+
+    // Schedule the next window. If an anchor is active, advance strictly by
+    // whole cycle lengths from the anchor so the phase never drifts; the
+    // window boundary itself still uses this bar's actual timestamp.
+    nextWindowStartTime := windowEnd + gapDays * 24 * 60 * 60 * 1000
+
+    if showBoxes
+        box.new(
+             left=windowStart,
+             right=windowEnd,
+             top=currentUpperPrice,
+             bottom=currentLowerPrice,
+             xloc=xloc.bar_time,
+             bgcolor=color.new(color.blue, 88),
+             border_color=color.blue,
+             border_width=1)
+
+    if showMiddleLine
+        line.new(
+             x1=windowStart,
+             y1=currentMiddlePrice,
+             x2=windowEnd,
+             y2=currentMiddlePrice,
+             xloc=xloc.bar_time,
+             color=color.yellow,
+             width=2,
+             style=line.style_dashed)
+
+//=============================================================================
+// PLOTS
+//=============================================================================
+plot(currentUpperPrice, title="Upper", color=color.green, linewidth=2, trackprice=true)
+plot(currentLowerPrice, title="Lower", color=color.red, linewidth=2, trackprice=true)
+plot(currentMiddlePrice, title="Middle", color=color.yellow, linewidth=1)
+
+//=============================================================================
+// SIGNALS
+//=============================================================================
+plotshape(insideSignal, title="Inside", style=shape.circle, color=color.green, size=size.normal, location=location.abovebar)
+plotshape(breakoutSignal, title="Breakout", style=shape.triangledown, color=color.red, size=size.normal, location=location.abovebar)
+plotshape(middleSignal, title="Middle", style=shape.square, color=color.yellow, size=size.normal, location=location.abovebar)
+
+//=============================================================================
+// LABELS
+//=============================================================================
+if barstate.islast and not na(currentUpperPrice)
+    label.delete(upperLabel)
+    label.delete(lowerLabel)
+
+    upperLabel := label.new(bar_index, currentUpperPrice, "Upper: " + str.tostring(currentUpperPrice, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white)
+    lowerLabel := label.new(bar_index, currentLowerPrice, "Lower: " + str.tostring(currentLowerPrice, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white)
+
+//=============================================================================
+// STATISTICS
+//=============================================================================
+insidePercent = totalWindows > 0 ? insideCount * 100.0 / totalWindows : 0
+breakoutPercent = totalWindows > 0 ? breakoutCount * 100.0 / totalWindows : 0
+middlePercent = totalWindows > 0 ? middleCount * 100.0 / totalWindows : 0
+
+//=============================================================================
+// TABLE
+//=============================================================================
+var table statsTable = table.new(position.top_right, 4, 10, border_width=1)
+
+if barstate.islast
+    table.cell(statsTable, 0, 0, "Condition", bgcolor=color.blue, text_color=color.white)
+    table.cell(statsTable, 1, 0, "Signal", bgcolor=color.blue, text_color=color.white)
+    table.cell(statsTable, 2, 0, "Count", bgcolor=color.blue, text_color=color.white)
+    table.cell(statsTable, 3, 0, "Percent", bgcolor=color.blue, text_color=color.white)
+
+    table.cell(statsTable, 0, 1, "Inside")
+    table.cell(statsTable, 1, 1, "●")
+    table.cell(statsTable, 2, 1, str.tostring(insideCount))
+    table.cell(statsTable, 3, 1, str.tostring(math.round(insidePercent, 2)) + "%")
+
+    table.cell(statsTable, 0, 2, "Breakout")
+    table.cell(statsTable, 1, 2, "▼")
+    table.cell(statsTable, 2, 2, str.tostring(breakoutCount))
+    table.cell(statsTable, 3, 2, str.tostring(math.round(breakoutPercent, 2)) + "%")
+
+    table.cell(statsTable, 0, 3, "Middle")
+    table.cell(statsTable, 1, 3, "■")
+    table.cell(statsTable, 2, 3, str.tostring(middleCount))
+    table.cell(statsTable, 3, 3, str.tostring(math.round(middlePercent, 2)) + "%")
+
+    table.cell(statsTable, 0, 4, "Total Windows")
+    table.cell(statsTable, 2, 4, str.tostring(totalWindows))
+
+    table.cell(statsTable, 0, 5, "Window Length")
+    table.cell(statsTable, 1, 5, str.tostring(windowLengthDays) + " day(s)")
+
+    table.cell(statsTable, 0, 6, "Gap")
+    table.cell(statsTable, 1, 6, str.tostring(gapDays) + " day(s)")
+
+    table.cell(statsTable, 0, 7, "Range")
+    table.cell(statsTable, 1, 7, "±" + str.tostring(rangePercent) + "%")
+
+    table.cell(statsTable, 0, 8, "Anchor")
+    table.cell(statsTable, 1, 8, useCustomStart ? "Custom" : "Auto")
+
+    table.cell(statsTable, 0, 9, "Upper / Lower")
+    table.cell(statsTable, 1, 9, str.tostring(currentUpperPrice, format.mintick) + " / " + str.tostring(currentLowerPrice, format.mintick))
